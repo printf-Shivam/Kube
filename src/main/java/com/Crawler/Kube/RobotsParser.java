@@ -52,6 +52,7 @@ public class RobotsParser {
             }
         } catch (Exception e) {
             // TODO: handle exception
+            System.err.println("error in fetching rule");
         }
         return disallowed;
     }

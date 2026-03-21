@@ -32,6 +32,7 @@ public class CrawlerEngine{
     private  ConcurrentHashMap<String, Integer> hostPageCount= new ConcurrentHashMap<>();
 
     private final RobotsParser robotsParser = new RobotsParser();
+    private final DatabaseManager dbManager = new DatabaseManager();
 
     public CrawlerEngine(List<String> seedList) {
         for(String seed: seedList)
@@ -116,11 +117,14 @@ public class CrawlerEngine{
 
             incrementHostCount(host);
 
+            dbManager.savePage(url, doc.outerHtml());
+
             for(Element link : doc.select("a[href]")){
                 addURL(link.absUrl("href"));
             }
 
         } catch (Exception e) {
+            System.err.println("error in processing url");
         }
         finally{
             activeHosts.remove(host);
