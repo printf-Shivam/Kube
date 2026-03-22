@@ -52,17 +52,8 @@ public class DatabaseManager {
 
     public void savePage(String url, String html) {
         queue.offer(new String[]{url, html});
-//        if (pstmt == null) return;
-//
-//        try {
-//            pstmt.setString(1, url);
-//            pstmt.setString(2, html);
-//            pstmt.executeUpdate();
-//            pstmt.clearParameters();
-//        } catch (Exception e) {
-//            System.err.println("failed to save page " + url + ": " + e.getMessage());
-//        }
     }
+
     private void startWriter(){
         Thread writer = new Thread(()->{
             while(true){
@@ -81,11 +72,40 @@ public class DatabaseManager {
                     pstmt.clearBatch();
                 }
                 catch (Exception e){
-                    System.err.println("DB writer Error");
+                    System.err.println("DB writer error");
                 }
             }
         });
         writer.setDaemon(true);
         writer.start();
+    }
+    public void close() {
+        try {
+            List<String[]> leftovers = new ArrayList<>();
+            queue.drainTo(leftovers);
+
+            if(!leftovers.isEmpty()){
+                for(String[] data : leftovers){
+                    pstmt.setString(1, data[0]);
+                    pstmt.setString(2, data[1]);
+                    pstmt.addBatch();
+                }
+                pstmt.executeBatch();
+                con.commit();
+                System.out.println("saved " + leftovers.size() +" leftover pages");
+            }
+
+            try(Statement stmt = con.createStatement()){
+                stmt.execute("PRAGMA wal_checkpoint(TRUNCATE);"); //after data is added to .db, delete wal file
+            }
+
+            if(con != null && !con.isClosed()){
+                con.close();
+                System.out.println("db closed");
+            }
+        }
+        catch(Exception e){
+            System.err.println("error in force stopping connection " +e.getMessage());
+        }
     }
 }

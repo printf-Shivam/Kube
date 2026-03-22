@@ -37,6 +37,12 @@ public class CrawlerEngine{
     public CrawlerEngine(List<String> seedList) {
         for(String seed: seedList)
             addURL(seed);
+
+        //if process gets killed manually
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("\n manual stoppage ");
+            dbManager.close();
+        }));
     }
 
     public void start() {
@@ -56,6 +62,7 @@ public class CrawlerEngine{
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
+        dbManager.close();
     }
 
     private boolean isCrawlComplete() {
