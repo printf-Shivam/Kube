@@ -28,31 +28,35 @@ public class RobotsParser {
         List<String> disallowed = new ArrayList<>();
         try {
             String robotsUrl = "https://" + host + "/robots.txt";
-            String body = Jsoup.connect(robotsUrl)
-                    .timeout(3000)
+
+            Connection.Response response = Jsoup.connect(robotsUrl)
+                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                    .timeout(5000)
                     .ignoreHttpErrors(true)
-                    .execute()
-                    .body();
+                    .execute();
+
+            if (response.statusCode() == 404) {
+                return disallowed;
+            }
+
+            String body = response.body();
             boolean applicable = false;
 
             for(String line : body.split("\n")){
                 line = line.trim();
 
                 if(line.toLowerCase().startsWith("user-agent:")) {
-
-                    String agent = line.substring(11).trim();
+                    String agent = line.substring(line.indexOf(':') + 1).trim();
                     applicable = agent.equals("*");
                 }
 
-                if(applicable && line.toLowerCase().startsWith("disallow")) {
-
-                    String path = line.substring(10).trim();
+                if(applicable && line.toLowerCase().startsWith("disallow:")) {
+                    String path = line.substring(line.indexOf(':') + 1).trim();
                     if(!path.isEmpty()) disallowed.add(path);
                 }
             }
-        } catch (Exception e) {
-            // TODO: handle exception
-            System.err.println("error in fetching rule");
+        } catch(Exception e) {
+            System.err.println("error fetching rules for "+host + " " + e.getMessage());
         }
         return disallowed;
     }

@@ -110,7 +110,7 @@ public class CrawlerEngine{
                     String url = queue.poll();
                     if(url == null) continue;
 
-                    if(!visited.add(url)) continue;
+//                    if(!visited.add(url)) continue;
 
                     activeHosts.add(host);
                     hostLastAccess.put(host, System.currentTimeMillis());
@@ -158,6 +158,8 @@ public class CrawlerEngine{
         String url = canonicalize(seed);
         if(url == null) return ;
 
+        if (!visited.add(url)) return;
+
         String host = getHost(url);
         if(host == null) return;
 
@@ -175,7 +177,11 @@ public class CrawlerEngine{
 
     private Document request(String url) {
         try {
-            Connection con = Jsoup.connect(url).timeout(5000).ignoreHttpErrors(true);
+            Connection con = Jsoup.connect(url)
+                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .timeout(10000)
+                    .ignoreHttpErrors(true);
             Document doc = con.get();
 
             if(con.response().statusCode()==200) {
