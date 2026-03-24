@@ -11,8 +11,15 @@ public class KubeApplication {
 	public static void main(String[] args) {
 
 		SpringApplication.run(KubeApplication.class, args);
-		CrawlerEngine crawler = new CrawlerEngine(List.of("https://en.wikipedia.org/wiki/Search_engine","https://www.geeksforgeeks.org/" ));
-		crawler.start();
+		List<String> seeds = List.of(
+				"https://portswigger.net/web-security/all-materials",
+				"https://owasp.org/www-community/attacks/",
+				"https://www.baeldung.com/java-concurrency",
+				"https://developer.salesforce.com/docs/atlas.en-us.secure_coding_guide.meta/secure_coding_guide/secure_coding_sql_injection.htm"
+		);
+
+		CrawlerEngine engine = new CrawlerEngine(seeds);
+		engine.start();
 	}
 
 }

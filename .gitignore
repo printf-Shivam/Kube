@@ -33,3 +33,4 @@ build/
 .vscode/
 /web_crawler/
 /searchengine.db
+/src/main/java/com/Crawler/Kube/DatabaseChecker.java
