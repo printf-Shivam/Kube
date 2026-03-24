@@ -1,12 +1,11 @@
 package com.Crawler.Kube;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.Statement;
+import java.sql.*;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 
 public class DatabaseManager {
@@ -37,6 +36,9 @@ public class DatabaseManager {
                         + "html_content TEXT NOT NULL"
                         + ");";
                 stmt.execute(createTableSQL);
+
+                String createFrontierQuery = "CREATE TABLE IF NOT EXISTS frontier (url TEXT UNIQUE NOT NULL);";
+                stmt.execute(createFrontierQuery);
             }
 
             String insertSQL = "INSERT OR IGNORE INTO pages(url, html_content) VALUES(?, ?)";
@@ -81,6 +83,7 @@ public class DatabaseManager {
     }
     public void close() {
         try {
+            if (con == null || con.isClosed()) return;
             List<String[]> leftovers = new ArrayList<>();
             queue.drainTo(leftovers);
 
@@ -107,5 +110,70 @@ public class DatabaseManager {
         catch(Exception e){
             System.err.println("error in force stopping connection " +e.getMessage());
         }
+    }
+
+    public Set<String> getVisitedUrls(){
+        Set<String> previousUrls = ConcurrentHashMap.newKeySet();
+        String query = "SELECT url from pages;";
+
+        try(Statement stmt = con.createStatement();
+            ResultSet rs = stmt.executeQuery(query)){
+
+            while(rs.next()){
+                previousUrls.add(rs.getString("url"));
+            }
+            con.commit();
+        }
+        catch(Exception e){
+            System.err.println("error getting previous urls: " + e.getMessage());
+        }
+
+        return previousUrls;
+    }
+
+    public void saveFrontier(List<String> remainingUrls){
+        if(remainingUrls.isEmpty()) return;
+        try{
+            if(con == null || con.isClosed()) return;
+
+            String query = "INSERT OR IGNORE INTO frontier(url) VALUES(?)";
+
+            try(PreparedStatement ps = con.prepareStatement(query)){
+                for(String url : remainingUrls){
+                    ps.setString(1,url);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+                con.commit();
+                System.out.println("saved " + remainingUrls.size() + "urls from frontier for resumption");
+
+            }
+            catch (Exception e) {
+                System.err.println("error saving frontier " + e.getMessage());
+            }
+        }
+        catch (Exception e) {
+            System.err.println("error saving frontier " + e.getMessage());
+        }
+
+    }
+
+    public List<String> loadFrontier(){
+        List<String> urls = new ArrayList<>();
+
+        try(Statement s = con.createStatement();
+            ResultSet rs = s.executeQuery("SELECT url FROM frontier")){
+
+            while(rs.next())
+                urls.add(rs.getString("url"));
+
+            s.execute("DELETE FROM frontier");
+            con.commit();
+        }
+        catch (Exception e){
+            System.err.println("error in loading frontier from db");
+        }
+
+        return urls;
     }
 }

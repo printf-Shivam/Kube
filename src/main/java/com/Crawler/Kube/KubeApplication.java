@@ -11,7 +11,7 @@ public class KubeApplication {
 	public static void main(String[] args) {
 
 		SpringApplication.run(KubeApplication.class, args);
-		CrawlerEngine crawler = new CrawlerEngine(List.of("https://en.wikipedia.org/wiki/Search_engine","https://github.com/" ));
+		CrawlerEngine crawler = new CrawlerEngine(List.of("https://en.wikipedia.org/wiki/Search_engine","https://www.geeksforgeeks.org/" ));
 		crawler.start();
 	}
 

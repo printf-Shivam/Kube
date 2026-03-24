@@ -2,6 +2,7 @@ package com.Crawler.Kube;
 
 import java.io.IOException;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
@@ -35,12 +36,23 @@ public class CrawlerEngine{
     private final DatabaseManager dbManager = new DatabaseManager();
 
     public CrawlerEngine(List<String> seedList) {
+        //filling visited set
+        Set<String> history = dbManager.getVisitedUrls();
+        visited.addAll(history);
+
+        //filling frontier
+        List<String> oldFrontier = dbManager.loadFrontier();
+        for(String url : oldFrontier)
+            addURL(url);
+
         for(String seed: seedList)
             addURL(seed);
 
         //if process gets killed manually
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             System.out.println("\n manual stoppage ");
+
+            saveFrontierState();
             dbManager.close();
         }));
     }
@@ -62,6 +74,7 @@ public class CrawlerEngine{
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
+        saveFrontierState();
         dbManager.close();
     }
 
@@ -119,19 +132,22 @@ public class CrawlerEngine{
 
     private void processUrl(String host, String url){
         try {
+            String path = getPath(url);
+            if (!robotsParser.isAllowed(host, path)) {
+                System.out.println("crawling not allowed :" + url);
+                return;
+            }
             Document doc = request(url);
             if(doc == null) return;
 
             incrementHostCount(host);
-
             dbManager.savePage(url, doc.outerHtml());
 
             for(Element link : doc.select("a[href]")){
                 addURL(link.absUrl("href"));
             }
-
         } catch (Exception e) {
-            System.err.println("error in processing url");
+            System.err.println("error in processing url: " + url);
         }
         finally{
             activeHosts.remove(host);
@@ -140,27 +156,19 @@ public class CrawlerEngine{
 
     private void addURL(String seed){
         String url = canonicalize(seed);
-
         if(url == null) return ;
-
 
         String host = getHost(url);
         if(host == null) return;
 
         if(!canCrawl(host)) return;
-
-        String path = getPath(url);
-        if(!robotsParser.isAllowed(host, path)) {
-            System.out.println("crawling not allowed ");
-            return;
-        }
         hostQueue.computeIfAbsent(host, h -> new LinkedBlockingQueue<>()).offer(url);
     }
 
     private String getPath(String url) {
         try {
             return new URL(url).getPath();
-        } catch (Exception e) {
+        }catch(Exception e) {
             return "/";
         }
     }
@@ -219,6 +227,15 @@ public class CrawlerEngine{
 
     private void incrementHostCount(String host){
         hostPageCount.merge(host,1,Integer::sum);
+    }
+
+    private void saveFrontierState(){
+        List<String> remaining = new ArrayList<>();
+
+        for(BlockingQueue<String> queue : hostQueue.values()){
+            remaining.addAll(queue);
+        }
+        dbManager.saveFrontier(remaining);
     }
 }
 
