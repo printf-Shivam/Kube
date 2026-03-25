@@ -12,6 +12,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+import com.microsoft.playwright.*;
+import com.microsoft.playwright.options.LoadState;
 import org.jsoup.Connection;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
@@ -35,7 +37,16 @@ public class CrawlerEngine{
     private final RobotsParser robotsParser = new RobotsParser();
     private final DatabaseManager dbManager = new DatabaseManager();
 
+    private Playwright playwright;
+    private Browser browser;
+    private BrowserContext context;
+
+    private final java.util.concurrent.Semaphore browserLimiter = new java.util.concurrent.Semaphore(3);
+
     public CrawlerEngine(List<String> seedList) {
+
+        initBrowser();
+        System.out.println("Browser initialized successfully");
         //filling visited set
         Set<String> history = dbManager.getVisitedUrls();
         visited.addAll(history);
@@ -54,6 +65,8 @@ public class CrawlerEngine{
 
             saveFrontierState();
             dbManager.close();
+            if (browser != null) browser.close();
+            if (playwright != null) playwright.close();
         }));
     }
 
@@ -76,6 +89,8 @@ public class CrawlerEngine{
         }
         saveFrontierState();
         dbManager.close();
+        browser.close();
+        playwright.close();
     }
 
     private boolean isCrawlComplete() {
@@ -175,7 +190,7 @@ public class CrawlerEngine{
         }
     }
 
-    private Document request(String url) {
+    private Document fetchWithJsoup(String url) {
         try {
             Connection con = Jsoup.connect(url)
                     .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
@@ -242,6 +257,95 @@ public class CrawlerEngine{
             remaining.addAll(queue);
         }
         dbManager.saveFrontier(remaining);
+    }
+
+    public void initBrowser() {
+        playwright = Playwright.create();
+
+        browser = playwright.chromium().launch(
+                new BrowserType.LaunchOptions()
+                        .setHeadless(false)
+        );
+
+        context = browser.newContext(
+                new Browser.NewContextOptions()
+                        .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36")
+                        .setViewportSize(1280, 800)
+        );
+    }
+
+    //use browser
+    private String fetchWithBrowser(String url) {
+        Page page = null;
+
+        try {
+            browserLimiter.acquire(); //limit concurrency so that multiple tabs are not overwhelming resources
+
+            page = context.newPage();
+
+            page.navigate(url, new Page.NavigateOptions().setTimeout(15000));
+            page.waitForLoadState(LoadState.NETWORKIDLE);
+            page.waitForSelector("body");
+
+            page.waitForTimeout(6000);
+
+            page.mouse().move(100, 100);
+            page.mouse().wheel(0, 500);
+
+            String html = page.content();
+
+            if (html.contains("Just a moment") || html.contains("Enable JavaScript")) {
+                System.out.println("Blocked page detected → skipping: " + url);
+                return null;
+            }
+
+            return html;
+
+        }
+        catch (Exception e) {
+            System.err.println("Browser fetch failed: " + url);
+            return null;
+
+        }
+        finally{
+            if(page != null){
+                try{
+                    page.close();
+                }
+                catch(Exception ignored){
+                    System.err.println("error in browser");
+                }
+            }
+            browserLimiter.release(); // release lock
+        }
+    }
+
+    private Document request(String url) {
+        try {
+            Document doc = fetchWithJsoup(url);
+
+            if (doc == null) return null;
+
+            String html = doc.outerHtml();
+
+            if(isBlockedOrEmpty(html)){
+                System.out.println("switching to browser: " + url);
+
+                String renderedHtml = fetchWithBrowser(url);
+                if(renderedHtml != null){
+                    doc = Jsoup.parse(renderedHtml);
+                }
+            }
+            return doc;
+        }
+        catch(Exception e) {
+            return null;
+        }
+    }
+    private boolean isBlockedOrEmpty(String html) {
+        return html.contains("Enable JavaScript")
+                || html.contains("Just a moment")
+                || html.length() < 2000;
     }
 }
 
