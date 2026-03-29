@@ -1,5 +1,7 @@
 package com.Crawler.Kube.indexer;
 
+import org.tartarus.snowball.ext.EnglishStemmer;
+
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -69,12 +71,18 @@ public class SearchIndex {
         //tokenize (break long texts into words)
         String[] words = cleanText.split("\\s+");
 
+        EnglishStemmer stemmer = new EnglishStemmer();
+
         //count freq of token for specific url
         for(String word : words) {
             if (word.length() < 2 || stopWords.contains(word)) continue;
 
-            invertedIndex.putIfAbsent(word, new HashMap<>());
-            Map<String, Integer> urlFreq = invertedIndex.get(word);
+            stemmer.setCurrent(word);
+            stemmer.stem();
+            String stemmed = stemmer.getCurrent();
+
+            invertedIndex.putIfAbsent(stemmed, new HashMap<>());
+            Map<String, Integer> urlFreq = invertedIndex.get(stemmed);
 
             //incr the freq of this word for this url
             urlFreq.put(url, urlFreq.getOrDefault(url, 0) + 1);
@@ -82,9 +90,12 @@ public class SearchIndex {
     }
 
     public void searchTest(String query) {
-        String targetWord = query.toLowerCase().trim();
-        System.out.println("Searching for: '" + targetWord + "'");
+        EnglishStemmer stemmer = new EnglishStemmer();
 
+        stemmer.setCurrent(query.toLowerCase().trim());
+        stemmer.stem();
+        String targetWord = stemmer.getCurrent();
+        System.out.println("searching for: '" + query + "' (Stemmed to: '" + targetWord + "')");
         if(invertedIndex.containsKey(targetWord)) {
             Map<String, Integer> results = invertedIndex.get(targetWord);
             System.out.println("Found in " + results.size() + " pages. top results:-");
@@ -108,7 +119,7 @@ public class SearchIndex {
         engine.buildIndex();
 
         //testing words to search
-        engine.searchTest("security");
+        engine.searchTest(".");
         engine.searchTest("vulnerability");
         engine.searchTest("java");
     }
