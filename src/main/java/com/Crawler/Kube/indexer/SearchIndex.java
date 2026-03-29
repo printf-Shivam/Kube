@@ -12,10 +12,10 @@ public class SearchIndex {
     private static final String DB_URL = "jdbc:sqlite:searchengine.db";
 
     // word -> (url->freq count). storing in RAM for now(in-memory)
-    private final Map<String, Map<String, Integer>> invertedIndex = new HashMap<>();
+    private static final Map<String, Map<String, Integer>> invertedIndex = new HashMap<>();
 
     // stop words removal, using NLTK's list
-    private final Set<String> stopWords = Set.of(
+    private static final Set<String> stopWords = Set.of(
             "i", "me", "my", "myself", "we", "our", "ours", "ourselves",
             "you", "your", "yours", "yourself", "yourselves",
             "he", "him", "his", "himself",
@@ -39,7 +39,7 @@ public class SearchIndex {
             "s", "t", "can", "will", "just", "don", "should", "now"
     );
 
-    public void buildIndex() {
+    public static void buildIndex() {
         System.out.println("loading clean text from db...");
         int docCount = 0;
 
@@ -64,7 +64,7 @@ public class SearchIndex {
         }
     }
 
-    private void indexDocument(String url, String text) {
+    private static void indexDocument(String url, String text) {
         //normalizing text(basic )
         String cleanText = text.toLowerCase().replaceAll("[^a-z0-9]", " ");
 
@@ -89,38 +89,11 @@ public class SearchIndex {
         }
     }
 
-    public void searchTest(String query) {
-        EnglishStemmer stemmer = new EnglishStemmer();
-
-        stemmer.setCurrent(query.toLowerCase().trim());
-        stemmer.stem();
-        String targetWord = stemmer.getCurrent();
-        System.out.println("searching for: '" + query + "' (Stemmed to: '" + targetWord + "')");
-        if(invertedIndex.containsKey(targetWord)) {
-            Map<String, Integer> results = invertedIndex.get(targetWord);
-            System.out.println("Found in " + results.size() + " pages. top results:-");
-
-            //relevant pages = high freq, so sort by highest freq
-            results.entrySet().stream()
-                    .sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-                    .limit(10)
-                    .forEach(entry ->
-                            System.out.println("-> " + entry.getKey() + " (total mentions: "+ entry.getValue() +")")
-                    );
-        }
-        else
-            System.out.println("no results found for '" + targetWord );
+    public Map<String, Map<String, Integer>> getInvertedIndex() {
+        return invertedIndex;
     }
 
-    public static void main(String[] args) {
-        SearchIndex engine = new SearchIndex();
-
-        //read from db and build index
-        engine.buildIndex();
-
-        //testing words to search
-        engine.searchTest(".");
-        engine.searchTest("vulnerability");
-        engine.searchTest("java");
+    public Set<String> getStopWords() {
+        return stopWords;
     }
 }
