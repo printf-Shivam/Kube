@@ -68,3 +68,5 @@ HTML content is stripped of tags and normalized. Words are processed (stop-word 
 When a user enters a query in the React UI, the Spring Boot API receives the request. The `QueryEngine` calculates the TF-IDF scores for the query terms against the indexed documents, sorts them by relevance, and returns the top results as a JSON response to the frontend.
 
 ---
+
+**This repo is copy of my old repo, accidentally made wrong commit with wrong .git file adn lost all track of commits and files** 
