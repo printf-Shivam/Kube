@@ -1,146 +1,190 @@
 package com.searchEngine.Kube.crawler;
 
-import com.microsoft.playwright.Browser;
-import com.microsoft.playwright.BrowserContext;
-import com.microsoft.playwright.BrowserType;
-import com.microsoft.playwright.Page;
-import com.microsoft.playwright.Playwright;
-import com.microsoft.playwright.options.LoadState;
-import java.io.IOException;
-import java.io.PrintStream;
 import java.net.URL;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLongArray;
 
 import com.searchEngine.Kube.database.DatabaseManager;
-import org.jsoup.Connection;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
+
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
 public class CrawlerEngine {
-    private final int MAX_THREAD = 20;
-    private final long HOST_DELAY = 1000L;
-    private final int MAX_PAGES = 100;
-    private ExecutorService executor = Executors.newFixedThreadPool(20);
-    private Set<String> visited = ConcurrentHashMap.newKeySet();
-    private ConcurrentHashMap<String, BlockingQueue<String>> hostQueue = new ConcurrentHashMap();
-    private Set<String> activeHosts = ConcurrentHashMap.newKeySet();
-    private ConcurrentHashMap<String, Long> hostLastAccess = new ConcurrentHashMap();
-    private ConcurrentHashMap<String, Integer> hostPageCount = new ConcurrentHashMap();
-    private final RobotsParser robotsParser = new RobotsParser();
-    private final DatabaseManager dbManager = new DatabaseManager();
-    private Playwright playwright;
-    private Browser browser;
-    private BrowserContext context;
-    private final Semaphore browserLimiter = new Semaphore(3);
 
-    public CrawlerEngine(List<String> seedList) {
-        this.initBrowser();
-        System.out.println("Browser initialized successfully");
-        Set<String> history = this.dbManager.getVisitedUrls();
-        this.visited.addAll(history);
+    private final int MAX_THREAD = 200;
+    private final int MAX_PAGES_PER_HOST = 100;
 
-        for(String url : this.dbManager.loadFrontier()) {
-            this.addURL(url);
+    private static final long HOST_DELAY_MS = 50;
+
+    private static class ScheduledHost implements Delayed {
+        final String host;
+        final long readyAt;
+
+        ScheduledHost(String host, long readyAt) {
+            this.host = host;
+            this.readyAt = readyAt;
         }
 
-        for(String seed : seedList) {
+        @Override
+        public long getDelay(TimeUnit unit) {
+            return unit.convert(readyAt - System.currentTimeMillis(), TimeUnit.MILLISECONDS);
+        }
+
+        @Override
+        public int compareTo(Delayed o) {
+            return Long.compare(readyAt, ((ScheduledHost) o).readyAt);
+        }
+    }
+
+    private final DelayQueue<ScheduledHost> readyHosts = new DelayQueue<>();
+
+    private static final int SIZE = 2_000_000;
+    private final AtomicLongArray visited = new AtomicLongArray(SIZE);
+
+
+    //thread pool
+    private final ExecutorService executor = Executors.newFixedThreadPool(MAX_THREAD);
+
+    private final ConcurrentHashMap<String, BlockingQueue<String>> hostQueue = new ConcurrentHashMap<>();
+    private final Set<String> activeHosts = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<String, Long> hostLastAccess = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Integer> hostPageCount = new ConcurrentHashMap<>();
+
+    //how many threads are allowed to crawl one host parallely
+    private final ConcurrentHashMap<String, Semaphore> hostSemaphores = new ConcurrentHashMap<>();
+    private static final int MAX_PER_HOST = 3;
+
+    private final BlockingQueue<PageData> dbQueue = new LinkedBlockingQueue<>(1000);
+
+    // writer accumulates pages and committs changes in one transaction
+    private static final int DB_BATCH_SIZE = 200;
+    //if our crawler is slow, it will never fill batch so we make commit in 2s
+    private static final long DB_BATCH_TIMEOUT_MS = 2000L;
+
+
+    private final RobotsParser robotsParser = new RobotsParser();
+    private final DatabaseManager dbManager = new DatabaseManager();
+
+    private long startTime;
+    private final AtomicInteger totalPages = new AtomicInteger(0);
+
+    private static final ThreadLocal<List<String>> linkBuffer =
+            ThreadLocal.withInitial(() -> new ArrayList<>(64));
+
+
+    public CrawlerEngine(List<String> seedList) {
+        dbManager.initJsQueueTable();
+
+        for (String seed : seedList) {
             this.addURL(seed);
         }
 
+        // accumulate pages till max size -> flush in DB
+        // we dont want pages to stay in RAM for too long it eats a lot of RAM
+        Thread dbWorker = new Thread(() -> {
+            List<PageData> batch = new ArrayList<>(DB_BATCH_SIZE);
+            long lastFlush = System.currentTimeMillis();
+
+            while (true) {
+                try {
+                    PageData data = dbQueue.poll(200, TimeUnit.MILLISECONDS);
+                    if (data != null) {
+                        batch.add(data);
+                    }
+
+                    boolean batchFull = batch.size() >= DB_BATCH_SIZE;
+                    boolean timedOut = System.currentTimeMillis() - lastFlush >= DB_BATCH_TIMEOUT_MS;
+
+                    if (!batch.isEmpty() && (batchFull || timedOut)) {
+                        dbManager.savePageBatch(batch);  //single transaction for all pages in batch
+                        batch.clear();
+                        lastFlush = System.currentTimeMillis();
+                    }
+                } catch (InterruptedException e) {
+                    // flush remaining pages before exiting
+                    if (!batch.isEmpty()) {
+                        dbManager.savePageBatch(batch);
+                    }
+                    return;
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+        dbWorker.setDaemon(true);
+        dbWorker.start();
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\n manual stoppage ");
-            this.saveFrontierState();
-            this.dbManager.close();
-            if (this.browser != null) {
-                this.browser.close();
-            }
-
-            if (this.playwright != null) {
-                this.playwright.close();
-            }
-
+            System.out.println("\n===== MANUAL STOP =====");
+            printStats();
+            saveFrontierState();
+            dbManager.close();
         }));
     }
 
     public void start() {
-        this.startDispatcher();
+        startTime = System.currentTimeMillis();
+        startDispatcher();
 
-        while(!this.isCrawlComplete()) {
+        while (!isCrawlComplete()) {
             try {
                 Thread.sleep(500L);
-            } catch (InterruptedException var3) {
+            } catch (InterruptedException e) {
                 break;
             }
         }
 
-        this.executor.shutdown();
-
+        executor.shutdown();
         try {
-            this.executor.awaitTermination(1L, TimeUnit.MINUTES);
+            executor.awaitTermination(1L, TimeUnit.MINUTES);
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
 
-        this.saveFrontierState();
-        this.dbManager.close();
-        this.browser.close();
-        this.playwright.close();
-    }
-
-    private boolean isCrawlComplete() {
-        if (!this.activeHosts.isEmpty()) {
-            return false;
-        } else {
-            for(BlockingQueue<String> queue : this.hostQueue.values()) {
-                if (!queue.isEmpty()) {
-                    return false;
-                }
-            }
-
-            return true;
-        }
+        printStats();
+        saveFrontierState();
+        dbManager.close();
     }
 
     private void startDispatcher() {
         Thread dispatcher = new Thread(() -> {
-            while(true) {
-                boolean dispatched = false;
+            while (true) {
+                try {
+                    // blocks until a host is ready
+                    ScheduledHost scheduled = readyHosts.take();
+                    String host = scheduled.host;
 
-                for(String host : this.hostQueue.keySet()) {
-                    if (!this.activeHosts.contains(host)) {
-                        long currentTime = System.currentTimeMillis();
-                        long lastAccess = (Long)this.hostLastAccess.getOrDefault(host, 0L);
-                        if (currentTime - lastAccess >= 1000L && this.canCrawl(host)) {
-                            BlockingQueue<String> queue = (BlockingQueue)this.hostQueue.get(host);
-                            if (queue != null && !queue.isEmpty()) {
-                                String url = (String)queue.poll();
-                                if (url != null) {
-                                    this.activeHosts.add(host);
-                                    this.hostLastAccess.put(host, System.currentTimeMillis());
-                                    this.executor.execute(() -> this.processUrl(host, url));
-                                    dispatched = true;
-                                }
-                            }
+                    Semaphore sem = hostSemaphores.computeIfAbsent(host, h -> new Semaphore(MAX_PER_HOST));
+
+                    if (!sem.tryAcquire() || !canCrawl(host)) {
+                        BlockingQueue<String> q = hostQueue.get(host);
+                        if (q != null && !q.isEmpty()) {
+                            readyHosts.offer(new ScheduledHost(host,
+                                    System.currentTimeMillis() + HOST_DELAY_MS));
                         }
+                        continue;
                     }
-                }
 
-                if (!dispatched) {
-                    try {
-                        Thread.sleep(50L);
-                    } catch (Exception var10) {
-                        return;
-                    }
+                    BlockingQueue<String> queue = hostQueue.get(host);
+                    if (queue == null || queue.isEmpty()) continue;
+
+                    String url = queue.poll();
+                    if (url == null) continue;
+
+                    hostLastAccess.put(host, System.currentTimeMillis());
+
+                    executor.execute(() -> processUrl(host, url));
+
+                } catch (InterruptedException e) {
+                    return; // dispatcher thread shutting down
                 }
             }
         });
@@ -150,210 +194,359 @@ public class CrawlerEngine {
 
     private void processUrl(String host, String url) {
         try {
-            String path = this.getPath(url);
-            if (this.robotsParser.isAllowed(host, path)) {
-                Document doc = this.request(url);
-                if (doc == null) {
-                    return;
-                }
+            String path = getPath(url);
+            if (!robotsParser.isAllowed(host, path)) return;
 
-                this.incrementHostCount(host);
-                this.dbManager.savePage(url, doc.outerHtml());
+            Semaphore sem = hostSemaphores.get(host); //max no of thread that will crawl one particular domain at a time
 
-                for(Element link : doc.select("a[href]")) {
-                    this.addURL(link.absUrl("href"));
-                }
-
-                return;
-            }
-
-            System.out.println("crawling not allowed :" + url);
-        } catch (Exception var10) {
-            System.err.println("error in processing url: " + url);
-            return;
-        } finally {
-            this.activeHosts.remove(host);
-        }
-
-    }
-
-    private void addURL(String seed) {
-        String url = this.canonicalize(seed);
-        if (url != null) {
-            if (this.visited.add(url)) {
-                String host = this.getHost(url);
-                if (host != null) {
-                    if (this.canCrawl(host)) {
-                        ((BlockingQueue)this.hostQueue.computeIfAbsent(host, (h) -> new LinkedBlockingQueue())).offer(url);
-                    }
+            try {
+                String html = fetchHtml(url);
+                if (html != null) {
+                    handleFetchedPage(host, url, html);
                 }
             }
+            finally {
+                if (sem != null) sem.release();
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error scheduling fetch: " + url);
+            e.printStackTrace();
+            activeHosts.remove(host);
         }
     }
 
-    private String getPath(String url) {
-        try {
-            return (new URL(url)).getPath();
-        } catch (Exception var3) {
-            return "/";
-        }
-    }
+    //setting up okhtml client
+    private final OkHttpClient client = new OkHttpClient.Builder()
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .build();
 
-    private Document fetchWithJsoup(String url) {
-        try {
-            Connection con = Jsoup.connect(url).userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36").header("Accept-Language", "en-US,en;q=0.9").timeout(10000).ignoreHttpErrors(true);
-            Document doc = con.get();
-            if (con.response().statusCode() == 200) {
-                PrintStream var10000 = System.out;
-                String var10001 = Thread.currentThread().getName();
-                var10000.println(var10001 + " visited: " + url);
+    private String fetchHtml(String url) {
+        Request request = new Request.Builder()
+                .url(url)
+                .header("User-Agent", "Mozilla/5.0")
+                .build();
+
+        try (Response response = client.newCall(request).execute()) {
+
+            if (!response.isSuccessful()) return null;
+
+            String body = response.body().string();
+
+            // limit size
+            if (body.length() > 500 * 1024) {
+                body = body.substring(0, 500 * 1024);
             }
 
-            return doc;
-        } catch (IOException var4) {
-            System.err.println("error in request method");
+            System.out.println(Thread.currentThread().getName() + " visited: " + url);
+
+            return body;
+
+        } catch (Exception e) {
             return null;
         }
     }
 
+    private void handleFetchedPage(String host, String url, String html) {
+        try {
+            if (needsJS(html)) {
+                dbManager.saveJsUrl(url);
+                return;
+            }
+
+            incrementHostCount(host);
+            totalPages.incrementAndGet();
+
+            List<String> links = extractLinks(html);
+
+            Document doc = Jsoup.parse(html);
+            String text = doc.text();
+            String title = doc.title();
+
+            PageData pageData = new PageData(url, title, text);
+
+            // help GC
+            html = null;
+            doc = null;
+
+            if (!dbQueue.offer(pageData, 2, TimeUnit.SECONDS)) {
+                System.err.println("[WARN] DB queue full, page dropped: " + url);
+            }
+
+            for (String link : links) {
+                String abs = resolveUrl(url, link);
+                if (abs != null) addURL(abs);
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error processing: " + url);
+            e.printStackTrace();
+        } finally {
+            BlockingQueue<String> q = hostQueue.get(host);
+            if (q != null && !q.isEmpty()) {
+                readyHosts.offer(new ScheduledHost(
+                        host,
+                        System.currentTimeMillis() + HOST_DELAY_MS
+                ));
+            }
+        }
+    }
+
+
+    private final int MAX_CONCURRENT_HOSTS = 1000;
+
+    private void addURL(String seed) {
+        String url = canonicalize(seed);
+        if (url == null) return;
+
+        long hash = hashUrl(url);
+        if (!addVisited(hash)) return;
+
+        String host = getHost(url);
+        if (host == null || !canCrawl(host)) return;
+
+        if (!hostQueue.containsKey(host) && hostQueue.size() >= MAX_CONCURRENT_HOSTS) {
+            return;
+        }
+
+        BlockingQueue<String> queue = hostQueue.computeIfAbsent(host, h -> new LinkedBlockingQueue<>(50));
+
+        if (queue.offer(url)) {
+            if (!activeHosts.contains(host)) {
+                readyHosts.offer(new ScheduledHost(host, System.currentTimeMillis()));
+            }
+        }
+    }
+
+
+    private boolean addVisited(long hash) {
+        if (hash == 0) hash = 1;
+        int index = getIndex(hash);
+        int startIndex = index;
+
+        while (true) {
+            long current = visited.get(index);
+
+            if (current == 0) {
+                if (visited.compareAndSet(index, 0, hash)) return true;
+                continue;
+            }
+
+            if (current == hash) return false; // duplicate
+
+            // linear probing in case of  collision
+            index = (index + 1) % SIZE;
+            if (index == startIndex) return false; // table full
+        }
+    }
+
+    private long hashUrl(String url) {
+        long hash = 1469598103934665603L;
+        for (int i = 0; i < url.length(); i++) {
+            hash ^= url.charAt(i);
+            hash *= 1099511628211L;
+        }
+        return hash;
+    }
+
+    private int getIndex(long hash) {
+        return (int) (Math.abs(hash) % SIZE);
+    }
+
+
+    //completely GPT generated, no human brain was involved here
+    private List<String> extractLinks(String html) {
+        List<String> links = linkBuffer.get();
+        links.clear(); // reuse
+
+        int i = 0;
+        int n = html.length();
+
+        while (i < n) {
+            if (html.regionMatches(true, i, "<a", 0, 2)) {
+                char nextChar = (i + 2 < n) ? html.charAt(i + 2) : ' ';
+                if (!Character.isWhitespace(nextChar) && nextChar != '>') {
+                    i++;
+                    continue;
+                }
+
+                int tagEnd = html.indexOf('>', i);
+                if (tagEnd == -1) break;
+
+                int hrefIndex = -1;
+                for (int j = i + 2; j < tagEnd - 4; j++) {
+                    if (html.regionMatches(true, j, "href=", 0, 5)) {
+                        hrefIndex = j;
+                        break;
+                    }
+                }
+
+                if (hrefIndex != -1) {
+                    int start = hrefIndex + 5;
+                    while (start < tagEnd && (html.charAt(start) == ' '
+                            || html.charAt(start) == '"'
+                            || html.charAt(start) == '\'')) {
+                        start++;
+                    }
+                    int end = start;
+                    while (end < tagEnd
+                            && html.charAt(end) != '"'
+                            && html.charAt(end) != '\''
+                            && html.charAt(end) != ' '
+                            && html.charAt(end) != '>') {
+                        end++;
+                    }
+                    if (end > start) {
+                        links.add(html.substring(start, end));
+                    }
+                }
+
+                i = tagEnd;
+            }
+            i++;
+        }
+
+        return links;
+    }
+
+
+    private boolean isCrawlComplete() {
+        if (!activeHosts.isEmpty()) return false;
+        if (!readyHosts.isEmpty()) return false;
+        for (BlockingQueue<String> q : hostQueue.values()) {
+            if (!q.isEmpty()) return false;
+        }
+        return true;
+    }
+
+
     private String canonicalize(String link) {
         try {
-            if (link != null && !link.isEmpty()) {
-                URL url = new URL(link);
-                String protocol = url.getProtocol();
-                if (!protocol.equals("https") && !protocol.equals("http")) {
-                    return null;
-                } else {
-                    String host = url.getHost().toLowerCase();
-                    String path = url.getPath();
-                    if (path == null || path.isEmpty()) {
-                        path = "/";
-                    }
-
-                    return protocol + "://" + host + path;
-                }
-            } else {
-                return null;
-            }
-        } catch (Exception var6) {
-            System.err.println("error in canonicalization method");
+            if (link == null || link.isEmpty()) return null;
+            URL url = new URL(link);
+            String protocol = url.getProtocol();
+            if (!protocol.equals("https") && !protocol.equals("http")) return null;
+            String host = url.getHost().toLowerCase();
+            String path = url.getPath();
+            if (path == null || path.isEmpty()) path = "/";
+            return protocol + "://" + host + path;
+        } catch (Exception e) {
             return null;
         }
     }
 
     private String getHost(String url) {
         try {
-            return (new URL(url)).getHost().toLowerCase();
-        } catch (Exception var3) {
-            System.err.println("error in fetching host");
+            return new URL(url).getHost().toLowerCase();
+        } catch (Exception e) {
             return null;
+        }
+    }
+
+    private String getPath(String url) {
+        try {
+            return new URL(url).getPath();
+        } catch (Exception e) {
+            return "/";
         }
     }
 
     private boolean canCrawl(String host) {
-        return (Integer)this.hostPageCount.getOrDefault(host, 0) < 100;
+        return hostPageCount.getOrDefault(host, 0) < MAX_PAGES_PER_HOST;
     }
 
     private void incrementHostCount(String host) {
-        this.hostPageCount.merge(host, 1, Integer::sum);
-    }
+        int count = hostPageCount.merge(host, 1, Integer::sum);
 
-    private void saveFrontierState() {
-        List<String> remaining = new ArrayList();
-
-        for(BlockingQueue<String> queue : this.hostQueue.values()) {
-            remaining.addAll(queue);
+        if (count >= MAX_PAGES_PER_HOST) {
+            hostQueue.remove(host);
+            hostLastAccess.remove(host);
+            System.out.println("[INFO] Host capped and evicted: " + host);
         }
-
-        this.dbManager.saveFrontier(remaining);
     }
 
-    public void initBrowser() {
-        this.playwright = Playwright.create();
-        this.browser = this.playwright.chromium().launch((new BrowserType.LaunchOptions()).setHeadless(false));
-        this.context = this.browser.newContext((new Browser.NewContextOptions()).setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36").setViewportSize(1280, 800));
-    }
-
-    private String fetchWithBrowser(String url) {
-        Page page = null;
-
-        String var17;
+    private String resolveUrl(String base, String link) {
         try {
-            this.browserLimiter.acquire();
-            page = this.context.newPage();
-            page.navigate(url, (new Page.NavigateOptions()).setTimeout((double)15000.0F));
-            page.waitForLoadState(LoadState.NETWORKIDLE);
-            page.waitForSelector("body");
-            page.waitForTimeout((double)6000.0F);
-            page.mouse().move((double)100.0F, (double)100.0F);
-            page.mouse().wheel((double)0.0F, (double)500.0F);
-            String html = page.content();
-            if (!html.contains("Just a moment") && !html.contains("Enable JavaScript")) {
-                var17 = html;
-                return var17;
-            }
-
-            System.out.println("Blocked page detected → skipping: " + url);
-            var17 = null;
-        } catch (Exception var15) {
-            System.err.println("Browser fetch failed: " + url);
-            var17 = null;
-            return var17;
-        } finally {
-            if (page != null) {
-                try {
-                    page.close();
-                } catch (Exception var14) {
-                    System.err.println("error in browser");
-                }
-            }
-
-            this.browserLimiter.release();
-        }
-
-        return var17;
-    }
-
-    private Document request(String url) {
-        try {
-            Document doc = this.fetchWithJsoup(url);
-            if (doc == null) {
-                return null;
-            } else {
-                String html = doc.outerHtml();
-                if (this.isBlockedOrEmpty(html)) {
-                    System.out.println("switching to browser: " + url);
-                    String renderedHtml = this.fetchWithBrowser(url);
-                    if (renderedHtml != null) {
-                        doc = Jsoup.parse(renderedHtml);
-                    }
-                }
-
-                return doc;
-            }
-        } catch (Exception var5) {
+            return new URL(new URL(base), link).toString();
+        } catch (Exception e) {
             return null;
         }
     }
 
-    private boolean isBlockedOrEmpty(String html) {
-        return html.contains("Enable JavaScript") || html.contains("Just a moment") || html.length() < 2000;
+    private boolean needsJS(String html) {
+        return html.length() < 2000
+                || html.contains("Enable JavaScript")
+                || html.contains("Just a moment");
     }
 
+    private void saveFrontierState() {
+        List<String> remaining = new ArrayList<>();
+        for (BlockingQueue<String> queue : hostQueue.values()) {
+            remaining.addAll(queue);
+        }
+        dbManager.saveFrontier(remaining);
+    }
+
+    //to keep track of stats (gpt generated)
+    private void printStats() {
+        long endTime = System.currentTimeMillis();
+        long totalTime = endTime - startTime;
+        int pages = totalPages.get();
+
+        System.out.println("\n===== CRAWLER PERFORMANCE =====");
+        System.out.println("Total Pages Crawled : " + pages);
+        System.out.println("Total Time (ms)     : " + totalTime);
+        if (pages > 0) {
+            System.out.printf("Pages per second    : %.2f%n", pages * 1000.0 / totalTime);
+            System.out.printf("Avg time/page (ms)  : %.2f%n", totalTime * 1.0 / pages);
+        }
+        Runtime rt = Runtime.getRuntime();
+        long used = rt.totalMemory() - rt.freeMemory();
+        System.out.println("Memory Used (MB)    : " + (used / (1024 * 1024)));
+        System.out.println("Allocated (MB)      : " + (rt.totalMemory() / (1024 * 1024)));
+        System.out.println("DB Reads            : " + dbManager.getDbReads());
+        System.out.println("DB Writes           : " + dbManager.getDbWrites());
+        System.out.println("================================\n");
+    }
+
+
     public static void main(String[] args) {
-        // 1. Prepare your initial seed URLs
         List<String> seedList = new ArrayList<>();
+
+        //seed list by gemini
+        // Tech & CS
         seedList.add("https://en.wikipedia.org/wiki/Computer_science");
         seedList.add("https://www.geeksforgeeks.org/");
+        seedList.add("https://stackoverflow.com/questions");
+        seedList.add("https://news.ycombinator.com/");
+        seedList.add("https://dev.to/");
+        seedList.add("https://www.infoq.com/");
+        seedList.add("https://thenewstack.io/");
+        seedList.add("https://www.theregister.com/");
+
+        // News & general
         seedList.add("https://www.bbc.com/news");
+        seedList.add("https://www.reuters.com/");
+        seedList.add("https://apnews.com/");
+        seedList.add("https://www.theguardian.com/");
 
-        System.out.println("--- Launching CrawlerEngine ---");
+        // Science & knowledge
+        seedList.add("https://www.scientificamerican.com/");
+        seedList.add("https://phys.org/");
+        seedList.add("https://arxiv.org/list/cs/recent");
+        seedList.add("https://www.nature.com/news");
 
+        // Reference
+        seedList.add("https://en.wikipedia.org/wiki/Artificial_intelligence");
+        seedList.add("https://en.wikipedia.org/wiki/Software_engineering");
+        seedList.add("https://en.wikipedia.org/wiki/Data_structure");
+        seedList.add("https://en.wikipedia.org/wiki/Operating_system");
+
+        System.out.println("--- Launching CrawlerEngine with " + seedList.size() + " seeds ---");
         CrawlerEngine crawler = new CrawlerEngine(seedList);
-
         System.out.println("Starting the crawl process...");
         crawler.start();
-
         System.out.println("Crawl sequence finished.");
     }
 }
