@@ -2,6 +2,7 @@ package com.searchEngine.Kube.crawler;
 
 import java.net.URL;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -50,6 +51,22 @@ public class CrawlerEngine {
     private final AtomicLongArray visited = new AtomicLongArray(SIZE);
 
 
+    // RAM staging buffer
+    private static final int RAM_BUFFER_CAPACITY = 500; // X
+    private static final int RAM_FLUSH_THRESHOLD = 250;  // Y
+
+//    private final ArrayDeque<PageData> ramBuffer = new ArrayDeque<>(RAM_BUFFER_CAPACITY);
+//    private final Object bufferLock = new Object();
+
+//    ram based buffer
+    private final PageData[] buffer = new PageData[RAM_BUFFER_CAPACITY];
+
+    private int head = 0;
+    private int tail = 0;
+    private int size = 0;
+    private final Object bufferLock = new Object();
+
+
     //thread pool
     private final ExecutorService executor = Executors.newFixedThreadPool(MAX_THREAD);
 
@@ -62,7 +79,7 @@ public class CrawlerEngine {
     private final ConcurrentHashMap<String, Semaphore> hostSemaphores = new ConcurrentHashMap<>();
     private static final int MAX_PER_HOST = 3;
 
-    private final BlockingQueue<PageData> dbQueue = new LinkedBlockingQueue<>(1000);
+    private final ArrayBlockingQueue<PageData> dbQueue = new ArrayBlockingQueue<>(2000);
 
     // writer accumulates pages and committs changes in one transaction
     private static final int DB_BATCH_SIZE = 200;
@@ -78,6 +95,7 @@ public class CrawlerEngine {
 
     private static final ThreadLocal<List<String>> linkBuffer =
             ThreadLocal.withInitial(() -> new ArrayList<>(64));
+
 
 
     public CrawlerEngine(List<String> seedList) {
@@ -105,6 +123,9 @@ public class CrawlerEngine {
 
                     if (!batch.isEmpty() && (batchFull || timedOut)) {
                         dbManager.savePageBatch(batch);  //single transaction for all pages in batch
+
+                        totalPages.addAndGet(batch.size());
+
                         batch.clear();
                         lastFlush = System.currentTimeMillis();
                     }
@@ -113,7 +134,22 @@ public class CrawlerEngine {
                     if (!batch.isEmpty()) {
                         dbManager.savePageBatch(batch);
                     }
+                    totalPages.addAndGet(batch.size());
                     return;
+
+//                catch (InterruptedException e) {
+//                    // Thread interrupted during shutdown hook sequence
+//                    if (!batch.isEmpty()) {
+//                        try {
+//                            int batchSize = batch.size();
+//                            dbManager.savePageBatch(batch);
+//                            totalPages.addAndGet(batchSize);
+//                        } catch (Exception dbEx) {
+//                            System.err.println("[ERROR] Final emergency flush failed");
+//                            dbEx.printStackTrace();
+//                        }
+//                    }
+//                    return; // Exit safely
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -128,6 +164,42 @@ public class CrawlerEngine {
             saveFrontierState();
             dbManager.close();
         }));
+
+//        Thread bufferFlusher = new Thread(() -> {
+//            while (true) {
+//                try {
+//                    Thread.sleep(500); // periodic flush
+//
+//                    synchronized (bufferLock) {
+//                        if (!ramBuffer.isEmpty()) {
+//                            flushBufferChunk(ramBuffer.size()); // flush all
+//                        }
+//                    }
+//                } catch (InterruptedException e) {
+//                    return;
+//                }
+//            }
+//        });
+//        bufferFlusher.setDaemon(true);
+//        bufferFlusher.start();
+
+//        Thread bufferFlusher = new Thread(() -> {
+//            while (true) {
+//                try {
+//                    Thread.sleep(500);
+//
+//                    synchronized (bufferLock) {
+//                        if (size > 0) {
+//                            flushBuffer(size);
+//                        }
+//                    }
+//                } catch (InterruptedException e) {
+//                    return;
+//                }
+//            }
+//        });
+//        bufferFlusher.setDaemon(true);
+//        bufferFlusher.start();
     }
 
     public void start() {
@@ -270,9 +342,7 @@ public class CrawlerEngine {
             html = null;
             doc = null;
 
-            if (!dbQueue.offer(pageData, 2, TimeUnit.SECONDS)) {
-                System.err.println("[WARN] DB queue full, page dropped: " + url);
-            }
+            dbQueue.offer(pageData);
 
             for (String link : links) {
                 String abs = resolveUrl(url, link);
@@ -509,6 +579,55 @@ public class CrawlerEngine {
         System.out.println("DB Writes           : " + dbManager.getDbWrites());
         System.out.println("================================\n");
     }
+
+//    private void addToBuffer(PageData pageData) { //for arrayDequq
+//        synchronized (bufferLock) {
+//            ramBuffer.add(pageData);
+//
+//            // trigger flush when threshold reached
+//            if (ramBuffer.size() >= RAM_FLUSH_THRESHOLD) {
+//                flushBufferChunk(RAM_FLUSH_THRESHOLD);
+//            }
+//        }
+//    }
+
+//    private void addToBuffer(PageData pageData) { //for array
+//        synchronized (bufferLock) {
+//
+//            // if full → force flush
+//            if (size == RAM_BUFFER_CAPACITY) {
+//                flushBuffer(RAM_FLUSH_THRESHOLD);
+//            }
+//
+//            buffer[tail] = pageData;
+//            tail = (tail + 1) % RAM_BUFFER_CAPACITY;
+//            size++;
+//
+//            if (size >= RAM_FLUSH_THRESHOLD) {
+//                flushBuffer(RAM_FLUSH_THRESHOLD);
+//            }
+//        }
+//    }
+
+//    private void flushBuffer(int count) { // for array method
+//        int actual = Math.min(count, size);
+//
+//        for (int i = 0; i < actual; i++) {
+//            PageData data = buffer[head];
+//            buffer[head] = null; // help GC
+//
+//            head = (head + 1) % RAM_BUFFER_CAPACITY;
+//            size--;
+//
+//            try {
+//                if (!dbQueue.offer(data, 1, TimeUnit.SECONDS)) {
+//                    System.err.println("[WARN] DB queue full, dropping page");
+//                }
+//            } catch (InterruptedException e) {
+//                Thread.currentThread().interrupt();
+//            }
+//        }
+//    }
 
 
     public static void main(String[] args) {

@@ -21,7 +21,10 @@ import org.tartarus.snowball.ext.EnglishStemmer;
 
 @Service
 public class QueryEngine {
-    private static final String DBurl = "jdbc:sqlite:searchengine.db";
+    private static final String URL = "jdbc:postgresql://localhost:5432/search_engine";
+    private static final String USER = "postgres";
+    private static final String PASSWORD = "2647";
+
     Set<String> stopWords;
     DatabaseManager databaseManager = new DatabaseManager();
     TFIDFCalculator tfidfCalculator = new TFIDFCalculator();
@@ -35,7 +38,7 @@ public class QueryEngine {
         String query = "SELECT url, frequency FROM inverted_index WHERE word = ?";
 
         try (
-                Connection con = DriverManager.getConnection("jdbc:sqlite:searchengine.db");
+                Connection con = DriverManager.getConnection(URL, USER, PASSWORD);
                 PreparedStatement pstmt = con.prepareStatement(query);
         ) {
             pstmt.setString(1, targetWord);

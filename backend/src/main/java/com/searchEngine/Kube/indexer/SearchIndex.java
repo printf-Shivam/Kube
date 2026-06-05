@@ -13,17 +13,18 @@ import org.tartarus.snowball.ext.EnglishStemmer;
 
 @Service
 public class SearchIndex {
-    private static final String DB_URL = "jdbc:sqlite:searchengine.db";
+    private static final String URL = "jdbc:postgresql://localhost:5432/search_engine";
+    private static final String USER = "postgres";
+    private static final String PASSWORD = "2647";
     private static final Set<String> stopWords = Set.of("i", "me", "my", "myself", "we", "our", "ours", "ourselves", "you", "your", "yours", "yourself", "yourselves", "he", "him", "his", "himself", "she", "her", "hers", "herself", "it", "its", "itself", "they", "them", "their", "theirs", "themselves", "what", "which", "who", "whom", "this", "that", "these", "those", "am", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "having", "do", "does", "did", "doing", "a", "an", "the", "and", "but", "if", "or", "because", "as", "until", "while", "of", "at", "by", "for", "with", "about", "against", "between", "into", "through", "during", "before", "after", "above", "below", "to", "from", "up", "down", "in", "out", "on", "off", "over", "under", "again", "further", "then", "once", "here", "there", "when", "where", "why", "how", "all", "any", "both", "each", "few", "more", "most", "other", "some", "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "s", "t", "can", "will", "just", "don", "should", "now");
 
     public static void buildIndex() {
         System.out.println("loading clean text from db...");
         String createTableSQL = "CREATE TABLE IF NOT EXISTS inverted_index (word TEXT, url TEXT, frequency INTEGER, PRIMARY KEY (word, url));";
         String selectPagesSQL = "SELECT url, clean_text FROM pages WHERE clean_text IS NOT NULL AND clean_text != '';";
-        String upsertSQL = "INSERT INTO inverted_index (word, url, frequency) VALUES (?, ?, ?) ON CONFLICT(word, url) DO UPDATE SET frequency = frequency + excluded.frequency;";
-
+        String upsertSQL = "INSERT INTO inverted_index (word, url, frequency) VALUES (?, ?, ?) ON CONFLICT(word, url) DO UPDATE SET frequency = inverted_index.frequency + excluded.frequency;";
         try (
-                Connection con = DriverManager.getConnection("jdbc:sqlite:searchengine.db");
+                Connection con = DriverManager.getConnection(URL, USER,PASSWORD);
                 Statement stmt = con.createStatement();
         ) {
             stmt.execute(createTableSQL);
@@ -45,7 +46,13 @@ public class SearchIndex {
                     }
                 }
 
-                pstmt.executeBatch();
+                try {
+                    pstmt.executeBatch();
+                    con.commit();
+                } catch (Exception e) {
+                    con.rollback();
+                    throw e;
+                }
                 con.commit();
                 System.out.println("index built successfully");
             }

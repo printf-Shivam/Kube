@@ -15,7 +15,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class DatabaseManager {
     private static final String URL = "jdbc:postgresql://localhost:5432/search_engine";
     private static final String USER = "postgres";
-    private static final String PASSWORD = "1234";
+    private static final String PASSWORD = "2647";
 
     private Connection con;
     private PreparedStatement pstmt;
